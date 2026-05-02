@@ -1,4 +1,4 @@
-# CEO: Crow-inspired Efficient Offloading for Mobile Edge Computing
+# CEO: Crow search based Efficient Offloading for Mobile Edge Computing
 
 This repository contains the official Python implementation of the **Crow-inspired Efficient Offloading (CEO)** algorithm for bi-objective task offloading in multi-server Mobile Edge Computing (MEC) environments.
 

@@ -95,7 +95,7 @@ A formal citation will be added once the paper is published. Until then, if you 
 
 ```bibtex
 @misc{ceo_mec_2026,
-  author = {Ananya Pandey},
+  author = {CEO},
   title  = {CEO: Crow-inspired Efficient Offloading for Mobile Edge Computing},
   year   = {2026},
   note   = {Manuscript under review},

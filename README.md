@@ -83,7 +83,7 @@ All parameters can be modified in the `SimulationConfig` class in `system_model.
 | GA | crossover = 0.9, mutation = 0.05, tournament = 3, elite = 2 |
 | PSO | w: 0.9 → 0.4 (linearly decreasing), c1 = c2 = 2.0 |
 | CSA (Askarzadeh, 2016) | AP = 0.1 (fixed), fl = 2.0 (fixed) |
-| **CEO (proposed)** | AP = 0.1 → 0.5 (adaptive), Lévy β = 1.5, greedy = 20%, elite = 30%, patience = 8, restart = 30% |
+| **CEO (proposed)** | AP = 0.1 → 0.5 (adaptive), Lévy β = 1.5, greedy = 20%, elite = 30%, patience = 5, restart = 30% |
 
 ## Reproducibility
 

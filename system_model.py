@@ -30,7 +30,7 @@ class SimulationConfig:
         bandwidth: float = 10e6,          # 10 MHz
         noise_power_dbm: float = -90,     # -90 dBm
         channel_gain_range: Tuple = (2e-6, 2e-5),
-        edge_processing_range: Tuple = (3e9, 5e9),     # 3-5 GHz
+        edge_processing_range: Tuple = (40e9, 50e9),   # 40-50 GHz 
         local_processing_range: Tuple = (100e6, 500e6), # 100-500 MHz
         task_size_range: Tuple = (300e3, 1000e3),       # 300-1000 KB in bytes
         cpu_cycles_range: Tuple = (200, 1000),          # 200-1000 cycles/byte
@@ -39,6 +39,7 @@ class SimulationConfig:
         vm_range: Tuple = (40, 100),      # U[40,100] VMs per server
         w1: float = 0.5,                  # weight for delay
         w2: float = 0.5,                  # weight for task failure ratio
+        normalize_delay: bool = False,    # divide T_total by all-local delay
         seed: Optional[int] = None
     ):
         self.num_tasks = num_tasks
@@ -55,6 +56,7 @@ class SimulationConfig:
         self.vm_range = vm_range
         self.w1 = w1
         self.w2 = w2
+        self.normalize_delay = normalize_delay
         self.seed = seed
 
 # MEC Environment
@@ -67,9 +69,54 @@ class MECEnvironment:
         self.tasks: List[Task] = []
         self.servers: List[EdgeServer] = []
         self._generate_environment()
+        self._build_arrays()
+        self.nfe = 0  
+
+   
+    def _build_arrays(self):
+        self._D = np.array([t.data_size for t in self.tasks])
+        self._cycles = np.array([t.data_size * t.cpu_cycles_per_byte for t in self.tasks])
+        self._Cl = np.array([t.device_processing_power for t in self.tasks])
+        self._p = np.array([t.transmit_power for t in self.tasks])
+        self._h = np.array([t.channel_gains for t in self.tasks])          # (m, n)
+        self._phi = np.array([t.deadline for t in self.tasks])
+        self._mu = np.array([s.processing_power / s.num_vms for s in self.servers])
+        self._K = np.array([s.num_vms for s in self.servers])
+        self._local_delay = self._cycles / self._Cl
+        self.T_ref = float(self._local_delay.sum())   
+
+    def reset_nfe(self):
+        self.nfe = 0
+
+    def task_delays(self, x: np.ndarray) -> np.ndarray:
+        """Vectorised per-task delay. Identical model to compute_task_delay():
+        interference only from other devices offloading to the SAME server."""
+        x = np.asarray(x, dtype=int)
+        m, n = self._h.shape
+        delays = self._local_delay.copy()
+        off = x > 0
+        if off.any():
+            idx = np.nonzero(off)[0]
+            j = x[idx] - 1
+            signal = self._p[idx] * self._h[idx, j]
+            per_server = np.bincount(j, weights=signal, minlength=n)
+            interference = np.maximum(per_server[j] - signal, 0.0)
+            rate = self.config.bandwidth * np.log2(1 + signal / (self.config.noise_power + interference))
+            delays[idx] = self._D[idx] / rate + self._cycles[idx] / self._mu[j]
+        return delays
+
+    def _objective(self, x: np.ndarray):
+        d = self.task_delays(x)
+        total_delay = float(d.sum())
+        tcr = float(np.mean(d <= self._phi))
+        counts = np.bincount(np.asarray(x, dtype=int), minlength=len(self.servers) + 1)[1:]
+        penalty = float(np.maximum(counts - self._K, 0).sum() * 10.0)
+        delay_term = total_delay / self.T_ref if self.config.normalize_delay else total_delay
+        obj = self.config.w1 * delay_term + self.config.w2 * (1 - tcr) + penalty
+        return obj, total_delay, tcr, penalty, d
     
     def _generate_environment(self):
-        """Generate tasks and edge servers with random parameters."""
+   
         cfg = self.config
         
         self.servers = []
@@ -201,45 +248,34 @@ class MECEnvironment:
         return penalty
     
     def fitness(self, offloading_decisions: np.ndarray) -> float:
-        """Compute fitness (Eq. 13) with capacity penalty for constraint (14c)."""
+        """Fitness (Eq. 12) + capacity penalty for (13b). Counts one evaluation."""
+        self.nfe += 1
+        return self._objective(offloading_decisions)[0]
+
+    def fitness_slow(self, offloading_decisions: np.ndarray) -> float:
+        """Original loop-based fitness, kept only to verify the fast version."""
         total_delay = self.compute_total_delay(offloading_decisions)
         tcr = self.compute_tcr(offloading_decisions)
         penalty = self.compute_capacity_penalty(offloading_decisions)
-        
-        obj = self.config.w1 * total_delay + self.config.w2 * (1 - tcr) + penalty
-        
-        return obj
-    
+        delay_term = total_delay / self.T_ref if self.config.normalize_delay else total_delay
+        return self.config.w1 * delay_term + self.config.w2 * (1 - tcr) + penalty
+
     def evaluate_solution(self, offloading_decisions: np.ndarray) -> dict:
-        total_delay = self.compute_total_delay(offloading_decisions)
-        tcr = self.compute_tcr(offloading_decisions)
-        fitness_val = self.fitness(offloading_decisions)
-        penalty = self.compute_capacity_penalty(offloading_decisions)
-        
-        # Per-task delays
-        task_delays = [
-            self.compute_task_delay(i, offloading_decisions)
-            for i in range(self.config.num_tasks)
-        ]
-        
-        # Offloading distribution
-        local_count = np.sum(offloading_decisions == 0)
-        edge_counts = [
-            np.sum(offloading_decisions == (j + 1))
-            for j in range(self.config.num_edge_servers)
-        ]
-        
+        """Final reporting (does NOT count towards NFE)."""
+        x = np.asarray(offloading_decisions, dtype=int)
+        fitness_val, total_delay, tcr, penalty, d = self._objective(x)
+        edge_counts = [int(np.sum(x == (j + 1))) for j in range(self.config.num_edge_servers)]
         return {
             'fitness': fitness_val,
             'total_delay': total_delay,
             'tcr': tcr,
             'penalty': penalty,
-            'task_delays': task_delays,
-            'local_tasks': int(local_count),
+            'task_delays': d.tolist(),
+            'local_tasks': int(np.sum(x == 0)),
             'edge_task_distribution': edge_counts,
-            'offloading_decisions': offloading_decisions.copy()
+            'offloading_decisions': x.copy()
         }
-    
+
     def generate_random_solution(self) -> np.ndarray:
         """Generate random offloading decision vector.
         Encoding: OD[i] = 0 means local execution,
@@ -276,7 +312,7 @@ if __name__ == "__main__":
           f"{'YES' if total_vms >= config.num_tasks else 'NO'}")
     print(f"Solution space per task: {env.get_solution_space_size()} options")
     
-    # Test with random solution
+
     solution = env.generate_random_solution()
     results = env.evaluate_solution(solution)
     

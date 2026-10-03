@@ -1,418 +1,206 @@
-import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import time
-import warnings
+
 import os
-import io
-from contextlib import redirect_stdout
+os.environ.setdefault("OMP_NUM_THREADS", "1")       
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+import argparse, csv, pickle, time, tracemalloc, itertools, platform
+from multiprocessing import Pool
+import numpy as np
 
 from system_model import SimulationConfig, MECEnvironment
-from algorithms import (
-    RandomOffloading, GeneticAlgorithm,
-    ParticleSwarmOptimization, CrowSearchAlgorithm
-)
+from algorithms import (RandomOffloading, GeneticAlgorithm, ParticleSwarmOptimization,
+                        CrowSearchAlgorithm, GAPSO)
 from ceo import CEO
+POP = 50                      # population size, all algorithms
+NFE_MAX = 15000               # identical evaluation budget, all algorithms and experiments
+W1_DEFAULT = 0.5              # w2 = 1 - w1
+NORMALIZE = True              # objective uses T_total / T_ref (T_ref = all-local total delay)
+EDGE_PROC_RANGE = (40e9, 50e9)   # C_j = U[40, 50] GHz  
+VM_RANGE = (40, 100)             # K_j = U[40, 100]     
 
-warnings.filterwarnings('ignore')
+# CEO parameters. g_f, e_f, P_s were selected by the E5 grid on tuning instances
+# 1001-1005 (never used for reported results). All other values as in the paper.
+CEO_PARAMS = dict(awareness_prob=0.1, flight_length=2.0, levy_beta=1.5,
+                  greedy_fraction=0.3, elite_fraction=0.3, stagnation_patience=5,
+                  restart_fraction=0.3)
 
-# Plots
-plt.rcParams.update({
-    'font.size': 11,
-    'axes.titlesize': 13,
-    'axes.labelsize': 12,
-    'legend.fontsize': 10,
-    'figure.dpi': 150,
-    'savefig.dpi': 150,
-    'savefig.bbox': 'tight'
-})
+TASKS_E1 = [50, 100, 150, 200]
+SERVERS_E1 = 5
+SCALE_CONFIGS = [(300, 5), (500, 5), (200, 10), (200, 15), (200, 20)]
+W1_SWEEP = [0.1, 0.3, 0.5, 0.7, 0.9]
+TUNING_SEEDS = [1001, 1002, 1003, 1004, 1005]
 
-COLORS = {
-    'RandomOffloading':          '#e74c3c',
-    'GeneticAlgorithm':          '#2ecc71',
-    'ParticleSwarmOptimization': '#3498db',
-    'CrowSearchAlgorithm':       '#9b59b6',
-    'CEO':                       '#f39c12'
+ABLATION = {                                        # variant name -> CEO switches
+    'CEO (full)':      {},
+    'w/o greedy init': {'init_mode': 'obl'},
+    'w/o greedy+OBL':  {'init_mode': 'random'},
+    'w/o memory adh.': {'use_memory': False},
+    'w/o Levy':        {'use_levy': False},
+    'w/o elite LS':    {'use_elite': False},
+    'w/o adaptive AP': {'use_adaptive_AP': False},
+    'w/o restart':     {'use_restart': False},
+    'CSA + OBL only':  {'init_mode': 'obl', 'use_memory': False, 'use_levy': False,
+                        'use_elite': False, 'use_adaptive_AP': False, 'use_restart': False},
+    'Discrete CSA':    {'init_mode': 'random', 'use_memory': False, 'use_levy': False,
+                        'use_elite': False, 'use_adaptive_AP': False, 'use_restart': False},
 }
-
-LABELS = {
-    'RandomOffloading':          'Random',
-    'GeneticAlgorithm':          'GA',
-    'ParticleSwarmOptimization': 'PSO',
-    'CrowSearchAlgorithm':       'CSA',
-    'CEO':                       'CEO'
-}
-
-MARKERS = {
-    'RandomOffloading':          'X',
-    'GeneticAlgorithm':          's',
-    'ParticleSwarmOptimization': 'o',
-    'CrowSearchAlgorithm':       'D',
-    'CEO':                       '*'
-}
-
-# Fixed parameters
-
-TASK_COUNTS   = [50, 100, 150, 200]
-FIXED_SERVERS = 5     
-POP_SIZE      = 50
-MAX_ITER      = 100
-W1            = 0.5   # weight for delay
-W2            = 0.5   # weight for tcr
-
-ALGO_KEYS = [
-    'RandomOffloading',
-    'GeneticAlgorithm',
-    'ParticleSwarmOptimization',
-    'CrowSearchAlgorithm',
-    'CEO'
-]
+ALGOS = ['Random', 'GA', 'PSO', 'CSA', 'GA-PSO', 'CEO']
+# =========================================================================
 
 
-CONVERGENCE_ALGO_KEYS = [
-    'GeneticAlgorithm',
-    'ParticleSwarmOptimization',
-    'CrowSearchAlgorithm',
-    'CEO'
-]
-
-N_RUNS     = 30
-CONV_SEEDS = list(range(1, N_RUNS + 1))   # seeds 1..30
-
-# Scenario labels for task experiments
-TASK_SCENARIO_LABELS = [
-    'S1\n(50 Tasks)',
-    'S2\n(100 Tasks)',
-    'S3\n(150 Tasks)',
-    'S4\n(200 Tasks)'
-]
+def make_env(n_tasks, n_servers, seed, w1=W1_DEFAULT):
+    cfg = SimulationConfig(num_tasks=n_tasks, num_edge_servers=n_servers,
+                           w1=w1, w2=1 - w1, normalize_delay=NORMALIZE, seed=seed,
+                           edge_processing_range=EDGE_PROC_RANGE, vm_range=VM_RANGE)
+    return MECEnvironment(cfg)
 
 
-# Shared algorithm factory (same hyperparameters used everywhere, only `seed` varies)
-def _build_algorithms(env, seed, max_iter=MAX_ITER, pop_size=POP_SIZE):
-   
-    return {
-        'RandomOffloading': RandomOffloading(
-            env, num_trials=pop_size * max_iter, seed=seed
-        ),
-        'GeneticAlgorithm': GeneticAlgorithm(
-            env, max_iterations=max_iter, population_size=pop_size,
-            crossover_rate=0.9, mutation_rate=0.05, tournament_size=3,
-            elite_count=2, seed=seed
-        ),
-        'ParticleSwarmOptimization': ParticleSwarmOptimization(
-            env, max_iterations=max_iter, population_size=pop_size,
-            w_start=0.9, w_end=0.4, c1=2.0, c2=2.0, seed=seed
-        ),
-        'CrowSearchAlgorithm': CrowSearchAlgorithm(
-            env, max_iterations=max_iter, population_size=pop_size,
-            awareness_prob=0.1, flight_length=2.0, seed=seed
-        ),
-        'CEO': CEO(
-            env, max_iterations=max_iter, population_size=pop_size,
-            awareness_prob=0.1, flight_length=2.0,
-            levy_beta=1.5, greedy_fraction=0.2, elite_fraction=0.3,
-            stagnation_patience=8, restart_fraction=0.3, seed=seed
-        ),
-    }
+def make_algo(name, env, seed, ceo_kwargs=None):
+    B = NFE_MAX
+    if name == 'Random':
+        return RandomOffloading(env, seed=seed, max_nfe=B)
+    if name == 'GA':
+        return GeneticAlgorithm(env, population_size=POP, crossover_rate=0.9, mutation_rate=0.05,
+                                tournament_size=3, elite_count=2, seed=seed, max_nfe=B)
+    if name == 'PSO':
+        return ParticleSwarmOptimization(env, population_size=POP, w_start=0.9, w_end=0.4,
+                                         c1=2.0, c2=2.0, seed=seed, max_nfe=B)
+    if name == 'CSA':
+        return CrowSearchAlgorithm(env, population_size=POP, awareness_prob=0.1,
+                                   flight_length=2.0, seed=seed, max_nfe=B)
+    if name == 'GA-PSO':
+        return GAPSO(env, population_size=POP, w=0.8, c1=1.5, c2=2.5, c3=2.0,
+                     mutation_rate=0.01, count_max=7, seed=seed, max_nfe=B)
+    if name == 'CEO':
+        kw = dict(CEO_PARAMS)
+        kw.update(ceo_kwargs or {})
+        return CEO(env, population_size=POP, seed=seed, max_nfe=B, **kw)
+    raise ValueError(name)
 
 
-def run_single_experiment(env, max_iter=MAX_ITER, pop_size=POP_SIZE, seed=50):
-    results = {}
-    algos = _build_algorithms(env, seed, max_iter, pop_size)
-    # dict preserves insertion order -> identical execution order to before:
-    # Random, GA, PSO, CSA, CEO
-    for name, algo in algos.items():
-        results[name] = algo.optimize()
-    return results
+def run_job(job):
+    exp, label, m, n, w1, algo, variant, kw, seed, mem = job
+    env = make_env(m, n, seed, w1)
+    opt = make_algo(algo, env, seed, kw)
+    if mem:
+        tracemalloc.start()
+    r = opt.optimize()
+    peak = tracemalloc.get_traced_memory()[1] / 1e6 if mem else float('nan')
+    if mem:
+        tracemalloc.stop()
+    row = dict(exp=exp, config=label, n_tasks=m, n_servers=n, w1=w1, algorithm=variant,
+               seed=seed, budget=NFE_MAX, fitness=r['fitness'], total_delay=r['total_delay'],
+               tcr=r['tcr'], nfe=r['nfe'], runtime_s=r['execution_time'], peak_mem_MB=peak,
+               local_tasks=r['local_tasks'],
+               server_counts=';'.join(str(c) for c in r['edge_task_distribution']))
+    conv = (np.array(r['nfe_history']), np.array(r['convergence_history']))
+    return row, conv
 
 
-class _SuppressStdout:
-   
-    def __enter__(self):
-        self._buf = io.StringIO()
-        self._ctx = redirect_stdout(self._buf)
-        self._ctx.__enter__()
-        return self
-
-    def __exit__(self, *exc):
-        self._ctx.__exit__(*exc)
-        return False
-
-
-def collect_convergence_statistics(env, seeds=CONV_SEEDS,
-                                    max_iter=MAX_ITER, pop_size=POP_SIZE,
-                                    verbose_every=10):
-   
-    metrics = {
-        algo: {'fitness': [], 'total_delay': [], 'tcr': [], 'execution_time': []}
-        for algo in ALGO_KEYS
-    }
-    histories = {k: [] for k in CONVERGENCE_ALGO_KEYS}
-
-    n_seeds = len(seeds)
-    for run_idx, seed in enumerate(seeds):
-        with _SuppressStdout():
-            algos = _build_algorithms(env, seed, max_iter, pop_size)
-            for name, algo in algos.items():
-                res = algo.optimize()
-                metrics[name]['fitness'].append(res['fitness'])
-                metrics[name]['total_delay'].append(res['total_delay'])
-                metrics[name]['tcr'].append(res['tcr'])
-                metrics[name]['execution_time'].append(res['execution_time'])
-                if name in histories:
-                    histories[name].append(res['convergence_history'])
-
-        if (run_idx + 1) % verbose_every == 0 or (run_idx + 1) == n_seeds:
-            print(f"    [{run_idx + 1:2d}/{n_seeds}] independent runs completed")
-
-    stats = {}
-    for algo in ALGO_KEYS:
-        m          = metrics[algo]
-        fitness_arr = np.array(m['fitness'])
-        delay_arr   = np.array(m['total_delay'])
-        tcr_arr     = np.array(m['tcr'])          # fraction, 0-1
-        time_arr    = np.array(m['execution_time'])
-
-        stats[algo] = {
-            'fitness_mean': float(fitness_arr.mean()),
-            'fitness_std':  float(fitness_arr.std()),
-            'delay_mean':   float(delay_arr.mean()),
-            'delay_std':    float(delay_arr.std()),
-            'tcr_mean':     float(tcr_arr.mean() * 100.0),   # percent
-            'tcr_std':      float(tcr_arr.std() * 100.0),    # percent
-            'time_mean':    float(time_arr.mean()),
-            'time_std':     float(time_arr.std()),
-        }
-
-        if algo in histories:
-            arr = np.array(histories[algo])  # shape (n_seeds, max_iter)
-            stats[algo]['conv_mean'] = arr.mean(axis=0)
-            stats[algo]['conv_std']  = arr.std(axis=0)
-            stats[algo]['conv_runs'] = arr
-
-    return stats
+def build_jobs(exp, seeds):
+    J = []
+    if exp == 'E1':
+        for k, m in enumerate(TASKS_E1):
+            for a, s in itertools.product(ALGOS, seeds):
+                J.append(('E1', f'S{k+1}', m, SERVERS_E1, W1_DEFAULT, a, a, None, s, False))
+        for k, m in enumerate(TASKS_E1):    # peak memory: one instance, tracemalloc (slow)
+            for a in ALGOS:
+                J.append(('E1mem', f'S{k+1}', m, SERVERS_E1, W1_DEFAULT, a, a, None, seeds[0], True))
+    elif exp == 'E2':
+        for k, m in [(2, 100), (4, 200)]:
+            for (v, kw), s in itertools.product(ABLATION.items(), seeds):
+                J.append(('E2', f'S{k}', m, SERVERS_E1, W1_DEFAULT, 'CEO', v, kw, s, False))
+    elif exp == 'E3':
+        for m, n in SCALE_CONFIGS:
+            for a, s in itertools.product(ALGOS, seeds):
+                J.append(('E3', f'{m}T-{n}S', m, n, W1_DEFAULT, a, a, None, s, False))
+    elif exp == 'E4':
+        for w1 in W1_SWEEP:
+            for a, s in itertools.product(['CEO', 'GA-PSO'], seeds):
+                J.append(('E4', f'w1={w1}', 200, SERVERS_E1, w1, a, a, None, s, False))
+    elif exp == 'E5':
+        for gf, ef, ps in itertools.product([0.1, 0.2, 0.3], [0.1, 0.3, 0.5], [5, 8, 12]):
+            kw = {'greedy_fraction': gf, 'elite_fraction': ef, 'stagnation_patience': ps}
+            for s in TUNING_SEEDS:
+                J.append(('E5', 'S2-tuning', 100, SERVERS_E1, W1_DEFAULT, 'CEO',
+                          f'gf={gf},ef={ef},Ps={ps}', kw, s, False))
+    return J
 
 
-def _plot_grouped_bar(data, algo_keys, scenario_labels, ylabel, title,
-                      savepath, value_fmt='{:.1f}', ylim=None, err=None):
-    n_algos     = len(algo_keys)
-    n_scenarios = len(scenario_labels)
+def run_experiment(exp, seeds, workers, out):
+    t0 = time.time()
+    print(f"\n=== {exp} ===")
+    jobs = build_jobs(exp, seeds)
+    part = os.path.join(out, f'{exp}_partial.csv')
+    convf = os.path.join(out, f'{exp}_conv_partial.pkl')
+    done = set()
+    if os.path.exists(part):
+        with open(part) as f:
+            for r in csv.DictReader(f):
+                done.add((r['exp'], r['config'], r['algorithm'], int(r['seed'])))
+    todo = [j for j in jobs if (j[0], j[1], j[6], j[8]) not in done]
+    print(f"  {len(jobs)} runs in total, {len(todo)} remaining, {workers} worker(s)")
+    # memory jobs are run last and alone so that other processes do not disturb them
+    normal = [j for j in todo if not j[9]]
+    memjobs = [j for j in todo if j[9]]
 
-    bar_w = 0.15
-    x     = np.arange(n_scenarios)
+    def save(row, conv):
+        new = not os.path.exists(part)
+        with open(part, 'a', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if new:
+                w.writeheader()
+            w.writerow(row)
+        if row['exp'] == 'E1':
+            with open(convf, 'ab') as f:
+                pickle.dump(((row['config'], row['algorithm']), conv), f)
 
-    fig, ax = plt.subplots(figsize=(13, 6))
+    n_done = 0
+    if normal:
+        with Pool(workers) as pool:
+            for row, conv in pool.imap_unordered(run_job, normal, chunksize=1):
+                save(row, conv); n_done += 1
+                if n_done % 50 == 0 or n_done == len(normal):
+                    print(f"  {n_done}/{len(normal)} runs done ({time.time()-t0:.0f} s)")
+    for j in memjobs:
+        save(*run_job(j))
 
-    for a_idx, algo in enumerate(algo_keys):
-        offsets  = x + (a_idx - (n_algos - 1) / 2) * bar_w
-        vals     = data[algo]
-        errs     = err[algo] if err is not None else None
-        bars     = ax.bar(
-            offsets, vals,
-            width=bar_w,
-            color=COLORS[algo],
-            label=LABELS[algo],
-            edgecolor='white',
-            linewidth=0.4,
-            alpha=0.9,
-            yerr=errs,
-            capsize=3,
-            error_kw={'linewidth': 1, 'ecolor': '#333333', 'alpha': 0.7}
-        )
-        for b_idx, (bar, val) in enumerate(zip(bars, vals)):
-            err_h = errs[b_idx] if errs is not None else 0.0
-            ax.text(
-                bar.get_x() + bar.get_width() / 2.,
-                bar.get_height() + err_h + (0.3 if 'TCR' in ylabel else 1.0),
-                value_fmt.format(val),
-                ha='center', va='bottom', fontsize=7.5, rotation=90
-            )
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(scenario_labels, fontsize=11)
-    ax.set_xlabel('Scenario')
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    ax.legend(title='Algorithm', loc='upper left')
-    ax.grid(axis='y', alpha=0.3)
-    if ylim:
-        ax.set_ylim(*ylim)
-
-    plt.tight_layout()
-    plt.savefig(savepath)
-    plt.close()
-
-
-def _print_table(stats, label):
-    print(f"\n{'='*95}")
-    print(f"  SCENARIO: {label}   (mean \u00b1 std over {N_RUNS} independent runs)")
-    print(f"{'='*95}")
-    print(f"  {'Algorithm':<10} | {'Fitness':>16} | "
-          f"{'Total Delay (s)':>18} | {'TCR (%)':>14} | {'Time (s)':>12}")
-    print(f"  {'-'*88}")
-    for algo in ALGO_KEYS:
-        r = stats[algo]
-        print(f"  {LABELS[algo]:<10} | "
-              f"{r['fitness_mean']:>8.4f} \u00b1 {r['fitness_std']:<5.4f} | "
-              f"{r['delay_mean']:>9.2f} \u00b1 {r['delay_std']:<6.2f} | "
-              f"{r['tcr_mean']:>6.1f} \u00b1 {r['tcr_std']:<5.1f} | "
-              f"{r['time_mean']:>6.2f} \u00b1 {r['time_std']:<3.2f}")
-
-    ceo_delay = stats['CEO']['delay_mean']
-    csa_delay = stats['CrowSearchAlgorithm']['delay_mean']
-    ceo_tcr   = stats['CEO']['tcr_mean']
-    csa_tcr   = stats['CrowSearchAlgorithm']['tcr_mean']
-
-    delay_imp = (csa_delay - ceo_delay) / csa_delay * 100
-    tcr_imp   = (ceo_tcr - csa_tcr) / csa_tcr * 100 if csa_tcr > 0 else float('inf')
-
-    print(f"\n  CEO vs CSA → Mean delay reduced by {delay_imp:.2f}%  |  "
-          f"Mean TCR improved by {tcr_imp:.2f}%")
-    print(f"{'='*95}")
+    with open(part) as f:
+        rows = list(csv.DictReader(f))
+    with open(os.path.join(out, f'{exp}.csv'), 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
+    if os.path.exists(convf):
+        convs = {}
+        with open(convf, 'rb') as f:
+            while True:
+                try:
+                    k, c = pickle.load(f)
+                except EOFError:
+                    break
+                convs.setdefault(k, []).append(c)
+        with open(os.path.join(out, 'E1_convergence.pkl'), 'wb') as f:
+            pickle.dump(convs, f)
+    print(f"  {exp} COMPLETE -> {os.path.join(out, exp + '.csv')} ({len(rows)} rows, {time.time()-t0:.0f} s)")
 
 
-# EXPERIMENT: Fixed servers = 5, Tasks: 50 / 100 / 150 / 200
-
-def experiment_task_scalability(output_dir):
-    print("\n" + "=" * 70)
-    print("  TASK SCALABILITY EXPERIMENT")
-    print("  Fixed Servers = 5  |  Tasks = 50, 100, 150, 200")
-    print(f"  Weights: w1={W1}, w2={W2}")
-    print("=" * 70)
-
-    all_results   = {}   # per scenario -> full 30-run stats dict (all 5 algos, all metrics)
-    delay_data    = {algo: [] for algo in ALGO_KEYS}
-    delay_err     = {algo: [] for algo in ALGO_KEYS}
-    tcr_data      = {algo: [] for algo in ALGO_KEYS}
-    tcr_err       = {algo: [] for algo in ALGO_KEYS}
-
-    for idx, n_tasks in enumerate(TASK_COUNTS):
-        print(f"\n  Running S{idx+1}: {n_tasks} tasks, {FIXED_SERVERS} servers ...")
-        config  = SimulationConfig(
-            num_tasks=n_tasks, num_edge_servers=FIXED_SERVERS,
-            w1=W1, w2=W2, seed=50
-        )
-        env     = MECEnvironment(config)
-
-        print(f"    Collecting {N_RUNS}-run statistics for S{idx+1}...")
-        stats = collect_convergence_statistics(
-            env, seeds=CONV_SEEDS, max_iter=MAX_ITER, pop_size=POP_SIZE
-        )
-        all_results[n_tasks] = stats
-
-        for algo in ALGO_KEYS:
-            delay_data[algo].append(stats[algo]['delay_mean'])
-            delay_err[algo].append(stats[algo]['delay_std'])
-            tcr_data[algo].append(stats[algo]['tcr_mean'])
-            tcr_err[algo].append(stats[algo]['tcr_std'])
-
-    
-    fig, axes  = plt.subplots(2, 2, figsize=(14, 10))
-    axes       = axes.flatten()
-    iterations = np.arange(1, MAX_ITER + 1)
-
-    for idx, n_tasks in enumerate(TASK_COUNTS):
-        ax      = axes[idx]
-        stats   = all_results[n_tasks]
-        s_label = f'S{idx+1} ({n_tasks} Tasks)'
-
-        
-        rf = stats['RandomOffloading']['fitness_mean']
-        ax.axhline(y=rf, color=COLORS['RandomOffloading'], linestyle='--',
-                   linewidth=1.5, label=f'Random ({rf:.2f})')
-
-        for algo in CONVERGENCE_ALGO_KEYS:
-            mean = stats[algo]['conv_mean']
-            std  = stats[algo]['conv_std']
-
-            ax.plot(iterations, mean,
-                    color=COLORS[algo], label=LABELS[algo],
-                    linewidth=2, marker=MARKERS[algo],
-                    markevery=10, markersize=6)
-            ax.fill_between(iterations, mean - std, mean + std,
-                             color=COLORS[algo], alpha=0.15, linewidth=0)
-
-        ax.set_title(f'Convergence — {s_label}, {FIXED_SERVERS} Servers ({N_RUNS} runs)')
-        ax.set_xlabel('Iteration')
-        ax.set_ylabel('Fitness')
-        ax.legend(fontsize=9)
-        ax.grid(True, alpha=0.3)
-
-    plt.suptitle(
-        f'Convergence Comparison — Task Scalability ({FIXED_SERVERS} Servers, '
-        f'mean \u00b1 std over {N_RUNS} runs)',
-        fontsize=14, fontweight='bold'
-    )
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'fig1_convergence.png'))
-    plt.close()
-    print("\n  Saved: fig1_convergence.png")
-
-    # Total Delay bar chart (mean ± std over 30 runs)
-    _plot_grouped_bar(
-        data            = delay_data,
-        algo_keys       = ALGO_KEYS,
-        scenario_labels = TASK_SCENARIO_LABELS,
-        ylabel          = 'Total Delay (s)',
-        title           = f'Total Delay with ({FIXED_SERVERS} Servers, mean \u00b1 std, {N_RUNS} runs)',
-        savepath        = os.path.join(output_dir, 'fig2a_total_delay.png'),
-        value_fmt       = '{:.1f}',
-        err             = delay_err
-    )
-    print("  Saved: fig2a_total_delay.png")
-
-    # TCR bar chart (mean ± std over 30 runs)
-    _plot_grouped_bar(
-        data            = tcr_data,
-        algo_keys       = ALGO_KEYS,
-        scenario_labels = TASK_SCENARIO_LABELS,
-        ylabel          = 'TCR (%)',
-        title           = f'Task Completion Ratio with ({FIXED_SERVERS} Servers, mean \u00b1 std, {N_RUNS} runs)',
-        savepath        = os.path.join(output_dir, 'fig2b_tcr.png'),
-        value_fmt       = '{:.1f}',
-        ylim            = (0, 65),
-        err             = tcr_err
-    )
-    print("  Saved: fig2b_tcr.png")
-
-    # Print result tables (mean ± std over 30 runs)
-    for idx, n_tasks in enumerate(TASK_COUNTS):
-        _print_table(all_results[n_tasks],
-                     f"S{idx+1}: {n_tasks} Tasks, {FIXED_SERVERS} Servers")
-
-    return all_results, delay_data, tcr_data
-
-
-# Main function
 def main():
-    output_dir = r'C:\Users\CSE\Desktop\Python\CO-01'
-    os.makedirs(output_dir, exist_ok=True)
-
-    start = time.time()
-
-    print("\n" + "#" * 70)
-    print("#   MEC OFFLOADING EXPERIMENTS                                #")
-    print("#   Algorithms : Random, GA, PSO, CSA, CEO                   #")
-    print(f"#   Population : {POP_SIZE}  |  Iterations : {MAX_ITER}"
-          + " " * 21 + "#")
-    print(f"#   Weights    : w1={W1}, w2={W2}"
-          + " " * 33 + "#")
-    print("#" * 70)
-
-    experiment_task_scalability(output_dir)
-
-    print(f"\n{'='*70}")
-    print(f"  EXPERIMENT COMPLETED in {time.time() - start:.1f}s")
-    print(f"  Output → {output_dir}/")
-    print(f"")
-    print(f"  Task Scalability (5 servers fixed, tasks vary):")
-    print(f"    fig1_convergence.png")
-    print(f"    fig2a_total_delay.png")
-    print(f"    fig2b_tcr.png")
-    print(f"{'='*70}")
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--exp', default='all', help='E1 | E2 | E3 | E4 | E5 | all (default: all)')
+    ap.add_argument('--runs', type=int, default=30)
+    ap.add_argument('--workers', type=int, default=max(1, (os.cpu_count() or 2) - 2))
+    ap.add_argument('--out', default='results')
+    ap.add_argument('--quick', action='store_true', help='2 instances only (test)')
+    a = ap.parse_args()
+    seeds = [1, 2] if a.quick else list(range(1, a.runs + 1))
+    os.makedirs(a.out, exist_ok=True)
+    with open(os.path.join(a.out, 'environment.txt'), 'w') as f:
+        f.write(f"python {platform.python_version()} | numpy {np.__version__} | "
+                f"{platform.platform()} | {platform.processor()} | workers={a.workers}\n")
+    exps = ['E5', 'E1', 'E2', 'E3', 'E4'] if a.exp == 'all' else [a.exp]
+    for e in exps:
+        run_experiment(e, seeds, a.workers, a.out)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':      # required on Windows for multiprocessing
     main()

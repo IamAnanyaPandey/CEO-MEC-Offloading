@@ -1,444 +1,292 @@
+"""Baselines: Random, GA, PSO, CSA, and GA-PSO.
+"""
 import numpy as np
 import time
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Optional
 from system_model import MECEnvironment
 
+
 class BaseOptimizer:
-    
     def __init__(self, env: MECEnvironment, max_iterations: int = 100,
-                 population_size: int = 50, seed: Optional[int] = None):
+                 population_size: int = 50, seed: Optional[int] = None,
+                 max_nfe: Optional[int] = None):
         self.env = env
         self.max_iterations = max_iterations
         self.population_size = population_size
+        self.max_nfe = max_nfe
         self.rng = np.random.RandomState(seed)
-        
         self.num_tasks = env.config.num_tasks
-        self.num_options = env.get_solution_space_size()  # 0 to n_servers
-        
-        # Tracking
+        self.num_options = env.get_solution_space_size()  # 0 = local, 1..n = servers
         self.convergence_history: List[float] = []
+        self.nfe_history: List[int] = []
         self.best_solution: Optional[np.ndarray] = None
         self.best_fitness: float = float('inf')
         self.execution_time: float = 0.0
-    
+
+    # ---- budget helpers -------------------------------------------------
+    def _should_stop(self, it: int) -> bool:
+        if self.max_nfe is not None:
+            return self.env.nfe >= self.max_nfe
+        return it >= self.max_iterations
+
+    def _progress(self, it: int) -> float:
+        if self.max_nfe is not None:
+            return min(1.0, self.env.nfe / self.max_nfe)
+        return it / self.max_iterations
+
+    def _record(self):
+        self.convergence_history.append(self.best_fitness)
+        self.nfe_history.append(self.env.nfe)
+
+    # ---- common ---------------------------------------------------------
     def _random_solution(self) -> np.ndarray:
-        """Generate random offloading decision vector.
-        Encoding: OD[i] = 0 means local execution,
-                  OD[i] = j (1..n) means offload to server j.
-        Equivalent to the binary matrix OD_ij in the paper.
-        """
         return self.rng.randint(0, self.num_options, size=self.num_tasks)
-    
+
     def _evaluate(self, solution: np.ndarray) -> float:
         return self.env.fitness(solution)
-    
+
     def _clip_solution(self, solution: np.ndarray) -> np.ndarray:
         return np.clip(np.round(solution).astype(int), 0, self.num_options - 1)
-    
+
     def optimize(self) -> dict:
         raise NotImplementedError
-    
+
     def get_results(self) -> dict:
-        
-        eval_results = self.env.evaluate_solution(self.best_solution)
-        eval_results['convergence_history'] = self.convergence_history
-        eval_results['execution_time'] = self.execution_time
-        eval_results['algorithm'] = self.__class__.__name__
-        return eval_results
+        r = self.env.evaluate_solution(self.best_solution)
+        r['convergence_history'] = self.convergence_history
+        r['nfe_history'] = self.nfe_history
+        r['nfe'] = self.env.nfe
+        r['execution_time'] = self.execution_time
+        r['algorithm'] = self.__class__.__name__
+        return r
 
 
-# 1. RANDOM OFFLOADING
-
+# 1. RANDOM OFFLOADING -------------------------------------------------------
 class RandomOffloading(BaseOptimizer):
-    
-    def __init__(self, env: MECEnvironment, num_trials: int = 1000,
-                 seed: Optional[int] = None):
-        super().__init__(env, max_iterations=1, population_size=num_trials, seed=seed)
-        self.num_trials = num_trials
-    
+    def __init__(self, env, num_trials: int = 1000, seed=None, max_nfe=None):
+        super().__init__(env, max_iterations=1, population_size=num_trials,
+                         seed=seed, max_nfe=max_nfe)
+        self.num_trials = max_nfe if max_nfe is not None else num_trials
+
     def optimize(self) -> dict:
-        print(f"\n{'='*60}")
-        print(f"  RANDOM OFFLOADING (Trials: {self.num_trials})")
-        print(f"{'='*60}")
-        
-        start_time = time.time()
-        
-        best_fitness = float('inf')
-        best_solution = None
-        fitness_history = []
-        
+        self.env.reset_nfe()
+        t0 = time.time()
+        step = max(1, self.num_trials // 100)
         for trial in range(self.num_trials):
-            solution = self._random_solution()
-            fitness = self._evaluate(solution)
-            
-            if fitness < best_fitness:
-                best_fitness = fitness
-                best_solution = solution.copy()
-            
-            # Record best fitness at regular intervals
-            if (trial + 1) % (self.num_trials // min(100, self.num_trials)) == 0:
-                fitness_history.append(best_fitness)
-        
-        self.best_solution = best_solution
-        self.best_fitness = best_fitness
-        self.convergence_history = fitness_history
-        self.execution_time = time.time() - start_time
-        
-        print(f"  Best Fitness: {self.best_fitness:.6f}")
-        print(f"  Time: {self.execution_time:.2f}s")
-        
+            s = self._random_solution()
+            f = self._evaluate(s)
+            if f < self.best_fitness:
+                self.best_fitness, self.best_solution = f, s.copy()
+            if (trial + 1) % step == 0:
+                self._record()
+        self.execution_time = time.time() - t0
         return self.get_results()
 
 
-# 2. GENETIC ALGORITHM (GA) — Li and Zhu [9], 2020
-#    Parameters from Table III:
-#    N=50, Tmax=100, Crossover=0.9, Mutation=0.05, Tournament=3, Elite=2
-
+# 2. GENETIC ALGORITHM (GA) — ---------------------------------
 class GeneticAlgorithm(BaseOptimizer):
-    def __init__(self, env: MECEnvironment, max_iterations: int = 100,
-                 population_size: int = 50, crossover_rate: float = 0.9,
-                 mutation_rate: float = 0.05, tournament_size: int = 3,
-                 elite_count: int = 2, seed: Optional[int] = None):
-        super().__init__(env, max_iterations, population_size, seed)
+    def __init__(self, env, max_iterations=100, population_size=50,
+                 crossover_rate=0.9, mutation_rate=0.05, tournament_size=3,
+                 elite_count=2, seed=None, max_nfe=None):
+        super().__init__(env, max_iterations, population_size, seed, max_nfe)
         self.crossover_rate = crossover_rate
         self.mutation_rate = mutation_rate
         self.tournament_size = tournament_size
         self.elite_count = elite_count
-    
-    def _initialize_population(self) -> np.ndarray:
-        """Initialize random population. Shape: (pop_size, num_tasks)"""
-        return np.array([self._random_solution()
-                         for _ in range(self.population_size)])
-    
-    def _tournament_selection(self, population: np.ndarray,
-                               fitness_values: np.ndarray) -> np.ndarray:
-        """Select parent via tournament selection."""
-        candidates = self.rng.choice(
-            self.population_size, size=self.tournament_size, replace=False
-        )
-        best_candidate = candidates[np.argmin(fitness_values[candidates])]
-        return population[best_candidate].copy()
-    
-    def _uniform_crossover(self, parent1: np.ndarray,
-                            parent2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+
+    def _tournament_selection(self, pop, fit):
+        c = self.rng.choice(self.population_size, size=self.tournament_size, replace=False)
+        return pop[c[np.argmin(fit[c])]].copy()
+
+    def _uniform_crossover(self, p1, p2):
         if self.rng.random() > self.crossover_rate:
-            return parent1.copy(), parent2.copy()
-        
+            return p1.copy(), p2.copy()
         mask = self.rng.random(self.num_tasks) < 0.5
-        child1 = np.where(mask, parent1, parent2)
-        child2 = np.where(mask, parent2, parent1)
-        return child1, child2
-    
-    def _mutate(self, individual: np.ndarray) -> np.ndarray:
-        mutant = individual.copy()
+        return np.where(mask, p1, p2), np.where(mask, p2, p1)
+
+    def _mutate(self, ind):
+        m = ind.copy()
         for i in range(self.num_tasks):
             if self.rng.random() < self.mutation_rate:
-                mutant[i] = self.rng.randint(0, self.num_options)
-        return mutant
-    
+                m[i] = self.rng.randint(0, self.num_options)
+        return m
+
     def optimize(self) -> dict:
-        print(f"\n{'='*60}")
-        print(f"  GENETIC ALGORITHM")
-        print(f"  Pop: {self.population_size} | Gens: {self.max_iterations}")
-        print(f"  Crossover: {self.crossover_rate} | Mutation: {self.mutation_rate}")
-        print(f"{'='*60}")
-        
-        start_time = time.time()
-        
-        population = self._initialize_population()
-        fitness_values = np.array([self._evaluate(ind) for ind in population])
-       
-        best_idx = np.argmin(fitness_values)
-        self.best_solution = population[best_idx].copy()
-        self.best_fitness = fitness_values[best_idx]
-        
-        for gen in range(self.max_iterations):
-            new_population = []
-            
-            # Elitism - preserve best individuals
-            elite_indices = np.argsort(fitness_values)[:self.elite_count]
-            for idx in elite_indices:
-                new_population.append(population[idx].copy())
-            
-            # Generate offspring
-            while len(new_population) < self.population_size:
-                # Selection
-                parent1 = self._tournament_selection(population, fitness_values)
-                parent2 = self._tournament_selection(population, fitness_values)
-                
-                # Crossover
-                child1, child2 = self._uniform_crossover(parent1, parent2)
-                
-                # Mutation
-                child1 = self._mutate(child1)
-                child2 = self._mutate(child2)
-                
-                new_population.append(child1)
-                if len(new_population) < self.population_size:
-                    new_population.append(child2)
-            
-            # Evaluate new population
-            population = np.array(new_population[:self.population_size])
-            fitness_values = np.array([self._evaluate(ind) for ind in population])
-            
-            # Update global best
-            gen_best_idx = np.argmin(fitness_values)
-            if fitness_values[gen_best_idx] < self.best_fitness:
-                self.best_fitness = fitness_values[gen_best_idx]
-                self.best_solution = population[gen_best_idx].copy()
-            
-            self.convergence_history.append(self.best_fitness)
-            
-            if (gen + 1) % 20 == 0:
-                print(f"  Gen {gen+1:3d}/{self.max_iterations}: "
-                      f"Best Fitness = {self.best_fitness:.6f}")
-        
-        self.execution_time = time.time() - start_time
-        print(f"  Final Best Fitness: {self.best_fitness:.6f}")
-        print(f"  Time: {self.execution_time:.2f}s")
-        
+        self.env.reset_nfe()
+        t0 = time.time()
+        pop = np.array([self._random_solution() for _ in range(self.population_size)])
+        fit = np.array([self._evaluate(ind) for ind in pop])
+        b = np.argmin(fit)
+        self.best_solution, self.best_fitness = pop[b].copy(), fit[b]
+        it = 0
+        while not self._should_stop(it):
+            new_pop = [pop[i].copy() for i in np.argsort(fit)[:self.elite_count]]
+            while len(new_pop) < self.population_size:
+                c1, c2 = self._uniform_crossover(self._tournament_selection(pop, fit),
+                                                 self._tournament_selection(pop, fit))
+                new_pop.append(self._mutate(c1))
+                if len(new_pop) < self.population_size:
+                    new_pop.append(self._mutate(c2))
+            pop = np.array(new_pop[:self.population_size])
+            fit = np.array([self._evaluate(ind) for ind in pop])
+            g = np.argmin(fit)
+            if fit[g] < self.best_fitness:
+                self.best_fitness, self.best_solution = fit[g], pop[g].copy()
+            self._record()
+            it += 1
+        self.execution_time = time.time() - t0
         return self.get_results()
 
 
-# 3. PARTICLE SWARM OPTIMIZATION (PSO) — You and Tang [19], 2021
-#    Parameters from Table III:
-#    N=50, Tmax=100, w=0.9→0.4, c1=2.0, c2=2.0
-
+# 3. PARTICLE SWARM OPTIMIZATION (PSO) —  -------------------
 class ParticleSwarmOptimization(BaseOptimizer):
-    
-    def __init__(self, env: MECEnvironment, max_iterations: int = 100,
-                 population_size: int = 50, w_start: float = 0.9,
-                 w_end: float = 0.4, c1: float = 2.0, c2: float = 2.0,
-                 seed: Optional[int] = None):
-        super().__init__(env, max_iterations, population_size, seed)
-        self.w_start = w_start
-        self.w_end = w_end
-        self.c1 = c1
-        self.c2 = c2
+    def __init__(self, env, max_iterations=100, population_size=50,
+                 w_start=0.9, w_end=0.4, c1=2.0, c2=2.0, seed=None, max_nfe=None):
+        super().__init__(env, max_iterations, population_size, seed, max_nfe)
+        self.w_start, self.w_end, self.c1, self.c2 = w_start, w_end, c1, c2
         self.v_max = (self.num_options - 1) / 2
-    
+
     def optimize(self) -> dict:
-        print(f"\n{'='*60}")
-        print(f"  PARTICLE SWARM OPTIMIZATION")
-        print(f"  Swarm: {self.population_size} | Iters: {self.max_iterations}")
-        print(f"  w: {self.w_start}→{self.w_end} | c1: {self.c1} | c2: {self.c2}")
-        print(f"{'='*60}")
-        
-        start_time = time.time()
-        
-        # Initialize particles (continuous, discretized for evaluation)
-        positions = self.rng.uniform(
-            0, self.num_options - 1,
-            size=(self.population_size, self.num_tasks)
-        )
-        
-        velocities = self.rng.uniform(
-            -self.v_max, self.v_max,
-            size=(self.population_size, self.num_tasks)
-        )
-        
-        # Personal bests
-        pbest_positions = positions.copy()
-        pbest_fitness = np.full(self.population_size, float('inf'))
-        
-        # Global best
-        gbest_position = None
-        gbest_fitness = float('inf')
-        
-        # Evaluate initial positions
-        for i in range(self.population_size):
-            discrete_pos = self._clip_solution(positions[i])
-            fit = self._evaluate(discrete_pos)
-            pbest_fitness[i] = fit
-            pbest_positions[i] = positions[i].copy()
-            
-            if fit < gbest_fitness:
-                gbest_fitness = fit
-                gbest_position = positions[i].copy()
-        
-        self.best_fitness = gbest_fitness
-        self.best_solution = self._clip_solution(gbest_position)
-        
-        # Iterative optimization
-        for iteration in range(self.max_iterations):
-            # Linearly decreasing inertia weight
-            w = self.w_start - (self.w_start - self.w_end) * (
-                iteration / self.max_iterations
-            )
-            
-            for i in range(self.population_size):
-                r1 = self.rng.random(self.num_tasks)
-                r2 = self.rng.random(self.num_tasks)
-                
-                # Update velocity
-                cognitive = self.c1 * r1 * (pbest_positions[i] - positions[i])
-                social = self.c2 * r2 * (gbest_position - positions[i])
-                velocities[i] = w * velocities[i] + cognitive + social
-                
-                # Clamp velocity
-                velocities[i] = np.clip(velocities[i], -self.v_max, self.v_max)
-                
-                # Update position
-                positions[i] = positions[i] + velocities[i]
-                
-                # Boundary handling
-                positions[i] = np.clip(positions[i], 0, self.num_options - 1)
-                
-                # Evaluate
-                discrete_pos = self._clip_solution(positions[i])
-                fit = self._evaluate(discrete_pos)
-                
-                # Update personal best
-                if fit < pbest_fitness[i]:
-                    pbest_fitness[i] = fit
-                    pbest_positions[i] = positions[i].copy()
-                
-                # Update global best
-                if fit < gbest_fitness:
-                    gbest_fitness = fit
-                    gbest_position = positions[i].copy()
-            
-            self.best_fitness = gbest_fitness
-            self.best_solution = self._clip_solution(gbest_position)
-            self.convergence_history.append(self.best_fitness)
-            
-            if (iteration + 1) % 20 == 0:
-                print(f"  Iter {iteration+1:3d}/{self.max_iterations}: "
-                      f"Best Fitness = {self.best_fitness:.6f}")
-        
-        self.execution_time = time.time() - start_time
-        print(f"  Final Best Fitness: {self.best_fitness:.6f}")
-        print(f"  Time: {self.execution_time:.2f}s")
-        
+        self.env.reset_nfe()
+        t0 = time.time()
+        N, m, ub = self.population_size, self.num_tasks, self.num_options - 1
+        pos = self.rng.uniform(0, ub, size=(N, m))
+        vel = self.rng.uniform(-self.v_max, self.v_max, size=(N, m))
+        pbest, pfit = pos.copy(), np.full(N, np.inf)
+        gbest, gfit = None, np.inf
+        for i in range(N):
+            f = self._evaluate(self._clip_solution(pos[i]))
+            pfit[i] = f
+            if f < gfit:
+                gfit, gbest = f, pos[i].copy()
+        self.best_fitness, self.best_solution = gfit, self._clip_solution(gbest)
+        it = 0
+        while not self._should_stop(it):
+            w = self.w_start - (self.w_start - self.w_end) * self._progress(it)
+            for i in range(N):
+                r1, r2 = self.rng.random(m), self.rng.random(m)
+                vel[i] = w * vel[i] + self.c1 * r1 * (pbest[i] - pos[i]) + self.c2 * r2 * (gbest - pos[i])
+                vel[i] = np.clip(vel[i], -self.v_max, self.v_max)
+                pos[i] = np.clip(pos[i] + vel[i], 0, ub)
+                f = self._evaluate(self._clip_solution(pos[i]))
+                if f < pfit[i]:
+                    pfit[i], pbest[i] = f, pos[i].copy()
+                if f < gfit:
+                    gfit, gbest = f, pos[i].copy()
+            self.best_fitness, self.best_solution = gfit, self._clip_solution(gbest)
+            self._record()
+            it += 1
+        self.execution_time = time.time() - t0
         return self.get_results()
 
 
-# 4. CROW SEARCH ALGORITHM (CSA) — Askarzadeh [2], 2016
-#    Standard CSA with FIXED AP and FIXED fl as per original paper.
-#    Parameters from Table III: AP=0.1, fl=2.0 (both constant throughout)
-#    Operates in continuous space with rounding — this is the standard
-#    approach; CEO's paper (Section V-A) explicitly critiques this limitation.
-
+# 4. CROW SEARCH ALGORITHM (CSA) — ---------------------------
 class CrowSearchAlgorithm(BaseOptimizer):
-    
-    def __init__(self, env: MECEnvironment, max_iterations: int = 100,
-                 population_size: int = 50, awareness_prob: float = 0.1,
-                 flight_length: float = 2.0, seed: Optional[int] = None):
-        super().__init__(env, max_iterations, population_size, seed)
-        self.AP = awareness_prob    # Fixed AP as per Askarzadeh (2016)
-        self.fl = flight_length     # Fixed fl as per Askarzadeh (2016)
-    
+    def __init__(self, env, max_iterations=100, population_size=50,
+                 awareness_prob=0.1, flight_length=2.0, seed=None, max_nfe=None):
+        super().__init__(env, max_iterations, population_size, seed, max_nfe)
+        self.AP, self.fl = awareness_prob, flight_length
+
     def optimize(self) -> dict:
-        print(f"\n{'='*60}")
-        print(f"  CROW SEARCH ALGORITHM (Standard Askarzadeh 2016)")
-        print(f"  Flock: {self.population_size} | Iters: {self.max_iterations}")
-        print(f"  AP: {self.AP} (fixed) | FL: {self.fl} (fixed)")
-        print(f"{'='*60}")
-        
-        start_time = time.time()
-        
-        # Initialize crow positions (continuous representation)
-        positions = self.rng.uniform(
-            0, self.num_options - 1,
-            size=(self.population_size, self.num_tasks)
-        )
-        
-        # Initialize memory (best known positions)
-        memory = positions.copy()
-        memory_fitness = np.full(self.population_size, float('inf'))
-        
-        for i in range(self.population_size):
-            discrete_pos = self._clip_solution(positions[i])
-            fit = self._evaluate(discrete_pos)
-            memory_fitness[i] = fit
-        
-        # Global best
-        best_idx = np.argmin(memory_fitness)
-        self.best_fitness = memory_fitness[best_idx]
-        self.best_solution = self._clip_solution(memory[best_idx])
-        
-        # Iterative optimization
-        for iteration in range(self.max_iterations):
-            new_positions = np.zeros_like(positions)
-            
-            for i in range(self.population_size):
-                # Randomly select a crow j to follow
-                j = self.rng.randint(0, self.population_size)
+        self.env.reset_nfe()
+        t0 = time.time()
+        N, m, ub = self.population_size, self.num_tasks, self.num_options - 1
+        pos = self.rng.uniform(0, ub, size=(N, m))
+        mem = pos.copy()
+        mfit = np.array([self._evaluate(self._clip_solution(pos[i])) for i in range(N)])
+        b = np.argmin(mfit)
+        self.best_fitness, self.best_solution = mfit[b], self._clip_solution(mem[b])
+        it = 0
+        while not self._should_stop(it):
+            new = np.zeros_like(pos)
+            for i in range(N):
+                j = self.rng.randint(0, N)
                 while j == i:
-                    j = self.rng.randint(0, self.population_size)
-                
-                r_j = self.rng.random()  # Awareness check
-                r_i = self.rng.random()  # Step size
-                
+                    j = self.rng.randint(0, N)
+                r_j, r_i = self.rng.random(), self.rng.random()
                 if r_j >= self.AP:
-                    # Crow j doesn't know it's being followed
-                    # Standard CSA position update (Eq. 2 in Askarzadeh 2016):
-                    # x_i^(t+1) = x_i^t + r_i * fl * (m_j^t - x_i^t)
-                    new_positions[i] = (
-                        positions[i] +
-                        r_i * self.fl * (memory[j] - positions[i])
-                    )
+                    new[i] = pos[i] + r_i * self.fl * (mem[j] - pos[i])
                 else:
-                    # Crow j is aware — random exploration
-                    new_positions[i] = self.rng.uniform(
-                        0, self.num_options - 1, size=self.num_tasks
-                    )
-                
-                # Boundary handling
-                new_positions[i] = np.clip(
-                    new_positions[i], 0, self.num_options - 1
-                )
-            
-            # Evaluate new positions and update memory
-            positions = new_positions
-            
-            for i in range(self.population_size):
-                discrete_pos = self._clip_solution(positions[i])
-                fit = self._evaluate(discrete_pos)
-                
-                # Update memory if new position is better
-                if fit < memory_fitness[i]:
-                    memory[i] = positions[i].copy()
-                    memory_fitness[i] = fit
-                
-                # Update global best
-                if fit < self.best_fitness:
-                    self.best_fitness = fit
-                    self.best_solution = discrete_pos.copy()
-            
-            self.convergence_history.append(self.best_fitness)
-            
-            if (iteration + 1) % 20 == 0:
-                print(f"  Iter {iteration+1:3d}/{self.max_iterations}: "
-                      f"Best Fitness = {self.best_fitness:.6f}")
-        
-        self.execution_time = time.time() - start_time
-        print(f"  Final Best Fitness: {self.best_fitness:.6f}")
-        print(f"  Time: {self.execution_time:.2f}s")
-        
+                    new[i] = self.rng.uniform(0, ub, size=m)
+                new[i] = np.clip(new[i], 0, ub)
+            pos = new
+            for i in range(N):
+                d = self._clip_solution(pos[i])
+                f = self._evaluate(d)
+                if f < mfit[i]:
+                    mem[i], mfit[i] = pos[i].copy(), f
+                if f < self.best_fitness:
+                    self.best_fitness, self.best_solution = f, d.copy()
+            self._record()
+            it += 1
+        self.execution_time = time.time() - t0
         return self.get_results()
 
 
-if __name__ == "__main__":
-    from system_model import SimulationConfig
-    
-    config = SimulationConfig(num_tasks=20, num_edge_servers=3, seed=50)
-    env = MECEnvironment(config)
-    
-    print("Testing all algorithms on small instance (20 tasks, 3 servers)...\n")
-    
-    # Random
-    rand = RandomOffloading(env, num_trials=100, seed=50)
-    rand.optimize()
-    
-    # GA
-    ga = GeneticAlgorithm(env, max_iterations=100, population_size=50, seed=50)
-    ga.optimize()
-    
-    # PSO
-    pso = ParticleSwarmOptimization(env, max_iterations=100, population_size=50, seed=50)
-    pso.optimize()
-    
-    # CSA
-    csa = CrowSearchAlgorithm(env, max_iterations=100, population_size=50, seed=50)
-    csa.optimize()
+# 5. GA-PSO — ---------
+class GAPSO(BaseOptimizer):
+
+    def __init__(self, env, max_iterations=100, population_size=50,
+                 w=0.8, c1=1.5, c2=2.5, c3=2.0, mutation_rate=0.01,
+                 count_max=7, savior_fraction=0.2, seed=None, max_nfe=None):
+        super().__init__(env, max_iterations, population_size, seed, max_nfe)
+        self.w, self.c1, self.c2, self.c3 = w, c1, c2, c3
+        self.sigma, self.count_max, self.savior_fraction = mutation_rate, count_max, savior_fraction
+        self.v_max = (self.num_options - 1) / 2
+
+    def optimize(self) -> dict:
+        self.env.reset_nfe()
+        t0 = time.time()
+        N, m, ub = self.population_size, self.num_tasks, self.num_options - 1
+        ev = lambda x: self._evaluate(self._clip_solution(x))
+        X = self.rng.uniform(0, ub, size=(N, m))
+        V = self.rng.uniform(-self.v_max, self.v_max, size=(N, m))
+        F = np.array([ev(X[i]) for i in range(N)])
+        P, PF = X.copy(), F.copy()                       # personal bests
+        g = np.argmin(PF); G, GF = P[g].copy(), PF[g]    # global best
+        count = np.zeros(N, dtype=int)
+        n_sub = max(2, int(round(self.savior_fraction * N)))
+        it = 0
+        while not self._should_stop(it):
+            # ---------------- GA stage: crossover, mutation, selection
+            for i in range(N):
+                k = self.rng.randint(0, N)
+                if PF[i] < PF[k]:
+                    phi = self.rng.random(m)
+                    O = phi * P[i] + (1 - phi) * G
+                else:
+                    O = P[k].copy()
+                mut = self.rng.random(m) < self.sigma
+                O[mut] = self.rng.uniform(0, ub, size=int(mut.sum()))
+                fo = ev(O)
+                if fo < F[i]:
+                    X[i], F[i] = O, fo
+                    count[i] = 0
+                else:
+                    count[i] += 1
+                if F[i] < PF[i]:
+                    P[i], PF[i] = X[i].copy(), F[i]
+                if F[i] < GF:
+                    G, GF = X[i].copy(), F[i]
+            # ---------------- Savior
+            for i in np.nonzero(count > self.count_max)[0]:
+                sub = self.rng.choice(N, size=n_sub, replace=False)
+                b = sub[np.argmin(F[sub])]
+                X[i], F[i], count[i] = X[b].copy(), F[b], 0
+            # ---------------- PSO stage (Eq. 14)
+            for i in range(N):
+                p1, p2, p3 = self.rng.random(m), self.rng.random(m), self.rng.random(m)
+                y = (self.c1 * p1 * P[i] + self.c2 * p2 * G) / (self.c1 * p1 + self.c2 * p2 + 1e-12)
+                V[i] = np.clip(self.w * (V[i] + self.c3 * p3 * (y - X[i])), -self.v_max, self.v_max)
+                X[i] = np.clip(X[i] + V[i], 0, ub)
+                F[i] = ev(X[i])
+                if F[i] < PF[i]:
+                    P[i], PF[i] = X[i].copy(), F[i]
+                if F[i] < GF:
+                    G, GF = X[i].copy(), F[i]
+            self.best_fitness, self.best_solution = GF, self._clip_solution(G)
+            self._record()
+            it += 1
+        self.best_fitness, self.best_solution = GF, self._clip_solution(G)
+        self.execution_time = time.time() - t0
+        return self.get_results()

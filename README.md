@@ -63,7 +63,7 @@ A summary table is also printed to the console for each scenario.
 | Maximum iterations | 100 |
 | Bandwidth | 10 MHz |
 | Noise power | -90 dBm |
-| Edge server CPU range | 3–5 GHz |
+| Edge server CPU range | 40-50 GHz |
 | Local CPU range | 100–500 MHz |
 | Task data size | 300–1000 KB |
 | CPU cycles per byte | 200–1000 |

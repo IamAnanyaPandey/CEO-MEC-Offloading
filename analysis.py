@@ -11,7 +11,7 @@ ALGOS = ['Random', 'GA', 'PSO', 'CSA', 'GA-PSO', 'CEO']
 BASE = [a for a in ALGOS if a != 'CEO']
 COL = {'Random': '#e74c3c', 'GA': '#2ecc71', 'PSO': '#3498db', 'CSA': '#9b59b6',
        'GA-PSO': '#7f8c8d', 'CEO': '#f39c12'}
-# ---- Name shown in figures and tables. Change it here only (CSV files keep 'CEO').
+
 PROPOSED_LABEL = 'CEO (Proposed)'
 NAME = lambda a: PROPOSED_LABEL if a == 'CEO' else a
 MRK = {'Random': 'x', 'GA': 's', 'PSO': 'o', 'CSA': 'D', 'GA-PSO': '^', 'CEO': '*'}
@@ -268,9 +268,9 @@ def main():
 
         algs3 = [x for x in ALGOS if x in set(T3.algorithm)]
         cols = ['n_tasks', 'n_servers', 'algorithm', 'total_delay', 'tcr']
-        allr = e3[cols]                          # e3 tcr is already in per cent
-        if e1 is not None:                       # add the E1 points (50-200 tasks, 5 servers)
-            r1 = e1[e1.exp == 'E1'][cols]        # e1 tcr is already in per cent as well
+        allr = e3[cols]                          
+        if e1 is not None:                       
+            r1 = e1[e1.exp == 'E1'][cols]        
             allr = pd.concat([allr, r1[r1.algorithm.isin(algs3)]])
         fig, axs = plt.subplots(2, 2, figsize=(7.0, 4.4))
         panels = [(allr.n_servers == 5, 'n_tasks', 'Number of tasks (5 servers)'),
@@ -285,7 +285,7 @@ def main():
                     ax.plot(g.index, g.values, marker=MRK[alg], color=COL[alg],
                             label=NAME(alg), lw=1.2, ms=4)
                 ax.set_xlabel(xl); ax.set_ylabel(yl); ax.grid(alpha=.3)
-                ticks = sorted(sub[xcol].unique())      # only the values actually simulated
+                ticks = sorted(sub[xcol].unique())      
                 ax.set_xticks(ticks); ax.set_xticklabels([str(int(t)) for t in ticks])
         axs[0, 0].legend(fontsize=6, ncol=2)
         fig.tight_layout(); save(fig, out, 'fig_scalability')
@@ -313,7 +313,7 @@ def main():
         say('\n=== E5: CEO parameter grid on tuning instances (mean fitness, lower is better) ===')
         G = e5.groupby('algorithm').fitness.agg(['mean', 'std']).sort_values('mean')
         say(G.round(5).to_string())
-        d = 'gf=0.2,ef=0.3,Ps=8'
+        d = 'gf=0.2,ef=0.3,Ps=5'
         if d in G.index:
             say(f'default {d}: rank {list(G.index).index(d)+1} of {len(G)}, '
                 f'gap to best {(G.loc[d,"mean"]/G["mean"].iloc[0]-1)*100:.2f}%')

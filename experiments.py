@@ -202,5 +202,5 @@ def main():
         run_experiment(e, seeds, a.workers, a.out)
 
 
-if __name__ == '__main__':      # required on Windows for multiprocessing
+if __name__ == '__main__':      
     main()

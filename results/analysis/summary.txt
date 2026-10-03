@@ -134,4 +134,5 @@ gf=0.1,ef=0.5,Ps=5   0.44872  0.05896
 gf=0.2,ef=0.5,Ps=5   0.45314  0.05827
 gf=0.2,ef=0.5,Ps=12  0.45328  0.05852
 gf=0.2,ef=0.5,Ps=8   0.45328  0.05852
-default gf=0.2,ef=0.3,Ps=8: rank 11 of 27, gap to best 0.45%
+range of mean fitness over 27 configurations: 1.97%
+default gf=0.3,ef=0.3,Ps=5: rank 1 of 27, gap to best 0.00%

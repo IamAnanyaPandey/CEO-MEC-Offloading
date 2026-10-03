@@ -313,7 +313,8 @@ def main():
         say('\n=== E5: CEO parameter grid on tuning instances (mean fitness, lower is better) ===')
         G = e5.groupby('algorithm').fitness.agg(['mean', 'std']).sort_values('mean')
         say(G.round(5).to_string())
-        d = 'gf=0.2,ef=0.3,Ps=5'
+        say(f'range of mean fitness over {len(G)} configurations: {(G["mean"].max()/G["mean"].min()-1)*100:.2f}%')
+        d = 'gf=0.3,ef=0.3,Ps=5'
         if d in G.index:
             say(f'default {d}: rank {list(G.index).index(d)+1} of {len(G)}, '
                 f'gap to best {(G.loc[d,"mean"]/G["mean"].iloc[0]-1)*100:.2f}%')

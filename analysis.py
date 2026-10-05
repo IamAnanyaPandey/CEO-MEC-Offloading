@@ -256,12 +256,14 @@ def main():
         rows = []
         for cfg in cfgs:
             ps = holm([paired_p(pair(e3, cfg, 'CEO', 'total_delay'), pair(e3, cfg, b, 'total_delay')) for b in BASE])
+            pst = holm([paired_p(pair(e3, cfg, 'CEO', 'tcr'), pair(e3, cfg, b, 'tcr')) for b in BASE])
             for alg in ALGOS:
                 g = e3[(e3.config == cfg) & (e3.algorithm == alg)]
                 rows.append(dict(config=cfg, algorithm=alg, n=len(g), budget=g.budget.iloc[0],
                                  delay=g.total_delay.mean(), tcr=g.tcr.mean(), time=g.runtime_s.mean(),
                                  local=g.local_tasks.mean(),
-                                 p=np.nan if alg == 'CEO' else dict(zip(BASE, ps))[alg]))
+                                    p=np.nan if alg == 'CEO' else dict(zip(BASE, ps))[alg],
+                                    p_tcr=np.nan if alg == 'CEO' else dict(zip(BASE, pst))[alg]))
         T3 = pd.DataFrame(rows); T3.to_csv(os.path.join(out, 'E3_summary.csv'), index=False)
         say(T3.round(3).to_string(index=False))
         show = ['GA', 'PSO', 'GA-PSO', 'CEO']
